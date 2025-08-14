@@ -1,6 +1,8 @@
 #include <iostream>
 #include "injector.h"
 
+#define SHELLCODE_BUFFER_SIZE 2 << 10
+
 uint64_t rva_to_file_offset(const IMAGE_SECTION_HEADER *sections, const size_t num_sections, const uint64_t rva) {
     for (size_t i = 0; i < num_sections; i++) {
         const uint64_t section_start = sections[i].VirtualAddress;
@@ -51,7 +53,7 @@ void base_relocate(char *dll, const uintptr_t buffer_ptr, const IMAGE_NT_HEADERS
         IMAGE_BASE_RELOCATION *relocation_block;
         size_t offset = section.PointerToRawData;
 
-        // Iterates through every relocation block.
+        // Iterate through every relocation block.
         while ((relocation_block = reinterpret_cast<IMAGE_BASE_RELOCATION *>(dll + offset))->SizeOfBlock >= sizeof(
                    IMAGE_BASE_RELOCATION)) {
             const auto words = reinterpret_cast<WORD *>(relocation_block + 1);
@@ -115,7 +117,8 @@ bool map_sections(HANDLE handle, const char *dll, const uintptr_t ptr, const IMA
     for (int i = 0; i < nt_headers->FileHeader.NumberOfSections; ++i) {
         const IMAGE_SECTION_HEADER section = sections[i];
 #ifdef MANUAL_MAP_DEBUG
-        std::cout << "[*] mapping section " << section.Name << " at " << (ptr + section.VirtualAddress) << " of size: " << section.Misc.VirtualSize << std::endl;
+        std::cout << "[*] mapping section " << section.Name << " at " << (ptr + section.VirtualAddress) << " of size: "
+                << section.Misc.VirtualSize << std::endl;
 #endif
         if (!WriteProcessMemory(handle, reinterpret_cast<LPVOID>(ptr + section.VirtualAddress),
                                 dll + section.PointerToRawData, section.SizeOfRawData, nullptr)) {
@@ -125,19 +128,129 @@ bool map_sections(HANDLE handle, const char *dll, const uintptr_t ptr, const IMA
     return true;
 }
 
-bool manual_map(DWORD process_id, char *dll) {
+c_manual_mapper::c_manual_mapper(HANDLE process) {
+    this->process = process;
+}
+
+c_manual_mapper::~c_manual_mapper() {
+    CloseHandle(this->process);
+}
+
+t_mapped_library *c_manual_mapper::manual_map(char *dll) const {
     const auto dos_header = reinterpret_cast<const IMAGE_DOS_HEADER *>(dll);
     if (dos_header->e_magic != IMAGE_DOS_SIGNATURE) {
         std::cerr << "[!] invalid DOS header!" << std::endl;
-        return false;
+        return nullptr;
     }
 
     const auto nt_headers = reinterpret_cast<const IMAGE_NT_HEADERS *>(dll + dos_header->e_lfanew);
     if (nt_headers->Signature != IMAGE_NT_SIGNATURE) {
         std::cerr << "[!] invalid NT headers!" << std::endl;
-        return false;
+        return nullptr;
     }
 
+    void *dll_buffer = allocate_dll_buffer(this->process, nt_headers->OptionalHeader.ImageBase,
+                                           nt_headers->OptionalHeader.SizeOfImage);
+    if (!dll_buffer) {
+        std::cerr << "[!] VirtualAllocEx failed!" << std::endl;
+        return nullptr;
+    }
+
+    std::cout << "[*] allocated " << nt_headers->OptionalHeader.SizeOfImage << " bytes at 0x" << std::hex << dll_buffer
+            << std::dec << std::endl;
+    base_relocate(dll, reinterpret_cast<uintptr_t>(dll_buffer), nt_headers);
+
+    if (!write_dll_header(this->process, dll, reinterpret_cast<uintptr_t>(dll_buffer), dos_header)) {
+        std::cerr << "[!] DLL Header writing failed!" << std::endl;
+        VirtualFreeEx(this->process, dll_buffer, 0, MEM_RELEASE);
+        return nullptr;
+    }
+
+    std::cout << "[*] wrote DLL header" << std::endl;
+    if (!map_sections(this->process, dll, reinterpret_cast<uintptr_t>(dll_buffer), nt_headers)) {
+        std::cerr << "[!] sections mapping failed!" << std::endl;
+        VirtualFreeEx(this->process, dll_buffer, 0, MEM_RELEASE);
+        return nullptr;
+    }
+
+    std::cout << "[*] mapped sections" << std::endl;
+    const t_loader_stub stub = {
+        .load_library_ptr = reinterpret_cast<void *>(LoadLibraryA),
+        .get_proc_address_ptr = reinterpret_cast<void *>(GetProcAddress),
+        .dll_base = dll_buffer,
+        .iat_resolve_mode = IATLoadLibrary,
+    };
+
+    // Write loader stub data to our process.
+    void *stub_buffer = VirtualAllocEx(this->process, nullptr, sizeof(t_loader_stub), MEM_COMMIT | MEM_RESERVE,
+                                       PAGE_READWRITE);
+    if (!stub_buffer || !WriteProcessMemory(this->process, stub_buffer, &stub, sizeof(t_loader_stub), nullptr)) {
+        std::cerr << "[!] stub buffer VirtualAllocEx/WPM failed!" << std::endl;
+        VirtualFreeEx(this->process, dll_buffer, 0, MEM_RELEASE);
+        return nullptr;
+    }
+    std::cout << "[*] wrote stub buffer" << std::endl;
+
+    // Now we write our loader stub function...
+    void *shellcode_buffer = VirtualAllocEx(this->process, nullptr, SHELLCODE_BUFFER_SIZE, MEM_COMMIT | MEM_RESERVE,
+                                            PAGE_EXECUTE_READWRITE);
+    if (!shellcode_buffer || !WriteProcessMemory(this->process, shellcode_buffer,
+                                                 reinterpret_cast<LPCVOID>(&loader_stub), SHELLCODE_BUFFER_SIZE,
+                                                 nullptr)) {
+        std::cerr << "[!] shellcode buffer VirtualAllocEx/WPM failed!" << std::endl;
+        VirtualFreeEx(this->process, dll_buffer, 0, MEM_RELEASE);
+        VirtualFreeEx(this->process, shellcode_buffer, 0, MEM_RELEASE);
+        return nullptr;
+    }
+    std::cout << "[*] wrote shellcode" << std::endl;
+
+    // Now, we open a thread calling our shellcode.
+    CreateRemoteThread(this->process, nullptr, 0, reinterpret_cast<LPTHREAD_START_ROUTINE>(shellcode_buffer),
+                       stub_buffer, 0, nullptr);
+    std::cout << "[*] created remote thread running shellcode" << std::endl;
+
+    const auto library = new t_mapped_library{
+        .base_address = reinterpret_cast<uintptr_t>(dll_buffer),
+    };
+
+    const auto sections = reinterpret_cast<const IMAGE_SECTION_HEADER *>(
+        reinterpret_cast<const char *>(&nt_headers->FileHeader) + sizeof(IMAGE_FILE_HEADER) + nt_headers->FileHeader.
+        SizeOfOptionalHeader
+    );
+
+    // if (nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size) {
+    //     const auto export_directory = reinterpret_cast<IMAGE_EXPORT_DIRECTORY *>(
+    //         dll + rva_to_file_offset(sections, nt_headers->FileHeader.NumberOfSections,
+    //                                  nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].
+    //                                  VirtualAddress));
+    //
+    //     const auto functions_table = reinterpret_cast<PDWORD>(dll + rva_to_file_offset(
+    //                                                               sections, nt_headers->FileHeader.NumberOfSections,
+    //                                                               export_directory->AddressOfFunctions));
+    //     const auto names_table = reinterpret_cast<PDWORD>(dll + rva_to_file_offset(
+    //                                                           sections, nt_headers->FileHeader.NumberOfSections,
+    //                                                           export_directory->AddressOfNames));
+    //     const auto ordinals_table = reinterpret_cast<PWORD>(dll + rva_to_file_offset(
+    //                                                              sections, nt_headers->FileHeader.NumberOfSections,
+    //                                                              export_directory->AddressOfNameOrdinals));
+    //
+    //     for (int i = 0; i < export_directory->NumberOfNames; ++i) {
+    //         const char *name = dll + rva_to_file_offset(
+    //                                sections, nt_headers->FileHeader.NumberOfSections,
+    //                                names_table[i]);
+    //
+    //         const WORD ordinal = ordinals_table[i];
+    //         const auto address = reinterpret_cast<uintptr_t>(dll_buffer) + functions_table[ordinal];
+    //
+    //         library->ordinal_exports[ordinal] = address;
+    //         library->exports[std::string(name)] = address;
+    //     }
+    // }
+
+    return library;
+}
+
+bool manual_map(DWORD process_id, char *dll) {
     HANDLE process_handle = OpenProcess(
         PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | /*PROCESS_VM_READ | */PROCESS_VM_WRITE, false, process_id);
     if (!process_handle) {
@@ -145,67 +258,13 @@ bool manual_map(DWORD process_id, char *dll) {
         return false;
     }
 
-    void *dll_buffer = allocate_dll_buffer(process_handle, nt_headers->OptionalHeader.ImageBase,
-                                           nt_headers->OptionalHeader.SizeOfImage);
-    if (!dll_buffer) {
-        std::cerr << "[!] VirtualAllocEx failed!" << std::endl;
-        CloseHandle(process_handle);
-        return false;
+    const c_manual_mapper mapper(process_handle);
+    t_mapped_library *library = mapper.manual_map(dll);
+    if (library) {
+        // std::cout << std::hex << library->exports["?TestExport@@YAXXZ"] << std::dec << std::endl;
+        free(library);
     }
-
-    std::cout << "[*] allocated " << nt_headers->OptionalHeader.SizeOfImage << " bytes at 0x" << std::hex << dll_buffer
-            << std::dec << std::endl;
-    base_relocate(dll, reinterpret_cast<uintptr_t>(dll_buffer), nt_headers);
-
-    if (!write_dll_header(process_handle, dll, reinterpret_cast<uintptr_t>(dll_buffer), dos_header)) {
-        std::cerr << "[!] DLL Header writing failed!" << std::endl;
-        VirtualFreeEx(process_handle, dll_buffer, 0, MEM_RELEASE);
-        CloseHandle(process_handle);
-        return false;
-    }
-
-    std::cout << "[*] wrote DLL header" << std::endl;
-    if (!map_sections(process_handle, dll, reinterpret_cast<uintptr_t>(dll_buffer), nt_headers)) {
-        std::cerr << "[!] sections mapping failed!" << std::endl;
-        VirtualFreeEx(process_handle, dll_buffer, 0, MEM_RELEASE);
-        CloseHandle(process_handle);
-        return false;
-    }
-
-    std::cout << "[*] mapped sections" << std::endl;
-    const t_loader_stub stub = {
-        .load_library_ptr = reinterpret_cast<void*>(LoadLibraryA),
-        .get_proc_address_ptr = reinterpret_cast<void*>(GetProcAddress),
-        .dll_base = dll_buffer,
-    };
-
-    // Write loader stub data to our process.
-    void *stub_buffer = VirtualAllocEx(process_handle, nullptr, sizeof(t_loader_stub), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!stub_buffer || !WriteProcessMemory(process_handle, stub_buffer, &stub, sizeof(t_loader_stub), nullptr)) {
-        std::cerr << "[!] stub buffer VirtualAllocEx/WPM failed!" << std::endl;
-        VirtualFreeEx(process_handle, dll_buffer, 0, MEM_RELEASE);
-        CloseHandle(process_handle);
-        return false;
-    }
-    std::cout << "[*] wrote stub buffer" << std::endl;
-
-    // Now we write our loader stub function...
-    void *shellcode_buffer = VirtualAllocEx(process_handle, nullptr, 0x800, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    if (!shellcode_buffer || !WriteProcessMemory(process_handle, shellcode_buffer, reinterpret_cast<LPCVOID>(&loader_stub), 0x800, nullptr)) {
-        std::cerr << "[!] shellcode buffer VirtualAllocEx/WPM failed!" << std::endl;
-        VirtualFreeEx(process_handle, dll_buffer, 0, MEM_RELEASE);
-        VirtualFreeEx(process_handle, shellcode_buffer, 0, MEM_RELEASE);
-        CloseHandle(process_handle);
-        return false;
-    }
-    std::cout << "[*] wrote shellcode" << std::endl;
-
-    // Now, we open a thread calling our shellcode.
-    CreateRemoteThread(process_handle, nullptr, 0, reinterpret_cast<LPTHREAD_START_ROUTINE>(shellcode_buffer), stub_buffer, 0, nullptr);
-    std::cout << "[*] created remote thread running shellcode" << std::endl;
-
-    CloseHandle(process_handle);
-    return true;
+    return library;
 }
 
 #ifdef _MSC_VER
@@ -232,7 +291,8 @@ void loader_stub(const t_loader_stub *stub) {
     const auto GetProcAddress_ = reinterpret_cast<t_get_proc_address>(stub->get_proc_address_ptr);
 
     // Resolve import address table (IAT).
-    if (nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size != 0) {
+    if (stub->iat_resolve_mode == IATLoadLibrary && nt_headers->OptionalHeader.DataDirectory[
+            IMAGE_DIRECTORY_ENTRY_IMPORT].Size) {
         auto import_descriptor = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR *>(
             stub_dll_base_ptr + nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
         while (import_descriptor->Name) {
